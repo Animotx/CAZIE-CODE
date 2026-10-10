@@ -1,0 +1,292 @@
+// ==UserScript==
+// @name         Cazie's Flag Challenge Helper
+// @namespace    local.cazie.flag-helper
+// @version      2.0.0
+// @description  Recognize standard country flags from SVG artwork, submit with a delay, record results, and advance.
+// @match        https://cazie-s.onrender.com/*
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  // Flag recognition compares the displayed SVG with public reference flag SVGs.
+  // It is intentionally confidence-gated because artwork variants can differ.
+  const KEY = '__cazieFlagHelper';
+  if (window[KEY]) return;
+
+  const state = { running: false, busy: false, queue: [], delay: 3000, timer: 0, catalog: null };
+  const panel = document.createElement('section');
+  panel.id = 'cazie-flag-helper';
+  panel.innerHTML = `
+    <header><strong>Flag helper</strong><button type="button" data-min aria-label="Minimize">−</button></header>
+    <div class="body">
+      <label><input data-auto type="checkbox" checked> Identify flags automatically</label>
+      <small>Compares Flagpedia and flag-icons SVGs. If confidence is low, it pauses instead of guessing.</small>
+      <label>Optional answer queue (one per line)</label>
+      <textarea data-answers rows="3" placeholder="Used instead of recognition when provided"></textarea>
+      <label>Wait between actions (seconds)</label>
+      <input data-delay type="number" min="1" max="120" value="3">
+      <div class="buttons"><button type="button" data-start>Start</button><button type="button" data-pause disabled>Pause</button></div>
+      <div data-status role="status">Open the flag challenge and press Start.</div>
+      <ol data-log></ol>
+      <small>Reference sites:
+        <a href="https://www.countryflags.com/" target="_blank" rel="noopener">CountryFlags.com</a> ·
+        <a href="https://flagpedia.net/" target="_blank" rel="noopener">Flagpedia</a> ·
+        <a href="https://worldflags.net/" target="_blank" rel="noopener">WorldFlags.net</a> ·
+        <a href="https://worldflagmap.com/" target="_blank" rel="noopener">World Flag Map</a>
+      </small>
+    </div>`;
+  const style = document.createElement('style');
+  style.textContent = `
+    #cazie-flag-helper{position:fixed;right:18px;bottom:18px;z-index:2147483647;width:290px;max-height:75vh;overflow:hidden;background:#fff;color:#24191c;border:1px solid #e9b8c4;border-radius:14px;box-shadow:0 8px 32px #32101c38;font:13px/1.4 system-ui,sans-serif}
+    #cazie-flag-helper *{box-sizing:border-box} #cazie-flag-helper header{display:flex;justify-content:space-between;align-items:center;padding:10px 13px;background:#cc4e69;color:#fff}
+    #cazie-flag-helper button{cursor:pointer;border:0;border-radius:7px;padding:7px 10px;background:#cc4e69;color:white;font-weight:700} #cazie-flag-helper button:disabled{opacity:.45;cursor:default}
+    #cazie-flag-helper header button{padding:0 7px;background:#ffffff30;font-size:18px} #cazie-flag-helper .body{padding:12px;overflow:auto;max-height:calc(75vh - 42px)}
+    #cazie-flag-helper label{display:block;margin:8px 0 4px;font-weight:650} #cazie-flag-helper textarea,#cazie-flag-helper input{width:100%;padding:8px;border:1px solid #e8c4cc;border-radius:7px;font:inherit;background:#fffafa;color:#24191c} #cazie-flag-helper [data-auto]{width:auto;vertical-align:middle} #cazie-flag-helper small{display:block;color:#635057}
+    #cazie-flag-helper .buttons{display:flex;gap:8px;margin-top:10px} #cazie-flag-helper [data-pause]{background:#6b5b60}
+    #cazie-flag-helper [data-status]{margin-top:9px;color:#635057} #cazie-flag-helper ol{padding-left:22px;max-height:135px;overflow:auto;margin:7px 0 0} #cazie-flag-helper li{margin:4px 0;overflow-wrap:anywhere}
+    #cazie-flag-helper.min .body{display:none}`;
+  document.documentElement.append(style, panel);
+  const $ = (sel) => panel.querySelector(sel);
+  const status = (msg) => { $('[data-status]').textContent = msg; };
+  const log = (answer, result) => {
+    const li = document.createElement('li');
+    li.textContent = `${answer} — ${result}`;
+    $('[data-log]').prepend(li);
+  };
+  const delay = () => new Promise((resolve) => { state.timer = window.setTimeout(resolve, state.delay); });
+  const isChallenge = () => [...document.querySelectorAll('h1,h2')].some((el) => /Which Country Does This Flag Belong To\?/i.test(el.textContent));
+  const waitFor = async (fn, timeout = 180000) => {
+    const end = Date.now() + timeout;
+    while (Date.now() < end && state.running) {
+      const value = fn();
+      if (value) return value;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    return null;
+  };
+
+  const aliasByCode = { bo:'Bolivia', cd:'Democratic Republic of the Congo', cg:'Republic of the Congo', ci:'Ivory Coast', cv:'Cape Verde', cz:'Czech Republic', gb:'United Kingdom', ir:'Iran', kp:'North Korea', kr:'South Korea', la:'Laos', md:'Moldova', mk:'North Macedonia', mm:'Myanmar', ru:'Russia', sz:'Eswatini', sy:'Syria', tw:'Taiwan', tz:'Tanzania', tr:'Turkey', us:'United States', va:'Vatican City', ve:'Venezuela', vn:'Vietnam', bn:'Brunei', fm:'Micronesia', ps:'Palestine' };
+  const cacheKey = (key) => `cazie_flag_ref_${key}`;
+  async function loadCatalog() {
+    if (state.catalog) return state.catalog;
+    const metaKey = cacheKey('flagpedia-country-list-v2');
+    let nameMap;
+    try { nameMap = JSON.parse(localStorage.getItem(metaKey) || 'null'); } catch {}
+    if (!nameMap || typeof nameMap !== 'object') {
+      status('Loading Flagpedia country list…');
+      const response = await fetch('https://flagcdn.com/en/codes.json');
+      if (!response.ok) throw new Error('Could not load Flagpedia country names (network/CORS).');
+      nameMap = await response.json();
+      try { localStorage.setItem(metaKey, JSON.stringify(nameMap)); } catch {}
+    }
+    const entries = Object.entries(nameMap).filter(([code]) => /^[a-z]{2}$/.test(code));
+    let cursor = 0;
+    let loaded = 0;
+    const refs = new Array(entries.length);
+    const worker = async () => {
+      while (cursor < entries.length) {
+        const i = cursor++;
+        const [code, displayName] = entries[i];
+        const name = aliasByCode[code] || displayName.replace(/\s*\([^)]*\)/g, '').trim();
+        const variants = [];
+        const sources = [
+          ['flagpedia', `https://flagcdn.com/${code}.svg`],
+          ['flag-icons', `https://raw.githubusercontent.com/lipis/flag-icons/main/flags/4x3/${code}.svg`],
+        ];
+        for (const [source, url] of sources) {
+          const key = cacheKey(`${source}-${code}`);
+          let svg = null;
+          try { svg = localStorage.getItem(key); } catch {}
+          if (!svg) {
+            try {
+              const res = await fetch(url);
+              if (res.ok) {
+                svg = await res.text();
+                if (svg.includes('<svg')) try { localStorage.setItem(key, svg); } catch {}
+              }
+            } catch {}
+          }
+          if (svg?.includes('<svg')) variants.push(svg);
+        }
+        if (variants.length) refs[i] = { name, code, variants };
+        loaded++;
+        if (loaded % 24 === 0) status(`Loading flag references… ${loaded}/${entries.length}`);
+      }
+    };
+    await Promise.all(Array.from({ length: 10 }, worker));
+    state.catalog = refs.filter(Boolean);
+    if (!state.catalog.length) throw new Error('No reference flags loaded. Check your connection and try again.');
+    return state.catalog;
+  }
+
+  function svgMarkupToPixels(markup) {
+    return new Promise((resolve, reject) => {
+      const parsed = new DOMParser().parseFromString(markup, 'image/svg+xml');
+      const root = parsed.documentElement;
+      const viewBox = root.getAttribute('viewBox')?.trim().split(/[ ,]+/).map(Number);
+      if (viewBox?.length === 4 && viewBox[2] > 0 && viewBox[3] > 0) {
+        root.setAttribute('width', String(viewBox[2]));
+        root.setAttribute('height', String(viewBox[3]));
+        root.setAttribute('preserveAspectRatio', 'none');
+        markup = new XMLSerializer().serializeToString(root);
+      }
+      const blob = new Blob([markup], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const image = new Image();
+      image.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = canvas.height = 48;
+          const ctx = canvas.getContext('2d', { willReadFrequently: true });
+          ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, 48, 48);
+          // The game normalizes its flag drawings into a square SVG viewBox;
+          // compare each reference in that same square coordinate space.
+          ctx.drawImage(image, 0, 0, 48, 48);
+          URL.revokeObjectURL(url);
+          resolve(ctx.getImageData(0, 0, 48, 48).data);
+        } catch (e) { URL.revokeObjectURL(url); reject(e); }
+      };
+      image.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Could not rasterize a flag SVG.')); };
+      image.src = url;
+    });
+  }
+
+  async function recognizeFlag() {
+    const svg = [...document.querySelectorAll('svg[viewBox]')].find((el) => {
+      const box = el.getAttribute('viewBox')?.trim().split(/[ ,]+/).map(Number);
+      return box?.length === 4 && box[2] >= 500 && box[3] >= 500 && el.querySelector('rect,path,circle,polygon');
+    });
+    if (!svg) throw new Error('Could not find the displayed flag SVG.');
+    const target = await svgMarkupToPixels(svg.outerHTML);
+    const refs = await loadCatalog();
+    const scores = [];
+    for (const ref of refs) {
+      let bestError = Infinity;
+      for (const variant of ref.variants) {
+        try {
+          const pixels = await svgMarkupToPixels(variant);
+          let total = 0;
+          for (let i = 0; i < target.length; i += 4) {
+            total += Math.abs(target[i] - pixels[i]) + Math.abs(target[i + 1] - pixels[i + 1]) + Math.abs(target[i + 2] - pixels[i + 2]);
+          }
+          bestError = Math.min(bestError, total / (target.length / 4 * 3));
+        } catch {}
+      }
+      if (Number.isFinite(bestError)) scores.push({ name: ref.name, error: bestError });
+    }
+    scores.sort((a, b) => a.error - b.error);
+    const best = scores[0];
+    if (!best) throw new Error('Could not compare this flag with the available references.');
+    const runnerUp = scores[1];
+    const similarity = Math.max(0, Math.round(100 * (1 - best.error / 100)));
+    const ambiguous = best.error > 20 || (runnerUp && runnerUp.error - best.error < 2.5);
+    return { name: best.name, confidence: similarity, error: best.error, ambiguous };
+  }
+
+  function stopWithMessage(message) {
+    state.running = false;
+    $('[data-start]').disabled = false;
+    $('[data-pause]').disabled = true;
+    status(message);
+  }
+
+  async function run() {
+    if (state.busy || !state.running) return;
+    state.busy = true;
+    try {
+      while (state.running) {
+        if (!isChallenge()) { status('Open the Country Flag Challenge to begin.'); await delay(); continue; }
+        const input = await waitFor(() => {
+          const el = document.querySelector('#flag-country-input');
+          return el && !el.disabled && el.offsetParent !== null ? el : null;
+        });
+        if (!input) break;
+        let answer = state.queue.shift();
+        if (!answer && $('[data-auto]').checked) {
+          status('Recognizing the current flag…');
+          let match;
+          try { match = await recognizeFlag(); }
+          catch (e) { stopWithMessage(e.message || 'Flag recognition failed.'); break; }
+          answer = match.name;
+          status(`${match.ambiguous ? 'Low-confidence best match' : 'Matched'}: ${answer} (${match.confidence}% pixel similarity). Typing anyway…`);
+          if (!state.running) break;
+        }
+        if (!answer) { stopWithMessage('No answer queued. Enable recognition or add answers.'); break; }
+        input.focus();
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        setter.call(input, answer);
+        input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: answer }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        // React-controlled inputs can ignore synthetic edits on some builds.
+        // Do not consume the queue or submit unless the displayed value sticks.
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        if (input.value.trim() !== answer) {
+          state.queue.unshift(answer);
+          state.running = false;
+          $('[data-start]').disabled = false;
+          $('[data-pause]').disabled = true;
+          status('Typing was blocked by the page. Click the game input once, then Start again.');
+          break;
+        }
+        await delay();
+        if (!state.running) break;
+        const form = input.closest('form');
+        const submit = form?.querySelector('button[type="submit"]');
+        if (!submit || submit.disabled) {
+          state.queue.unshift(answer);
+          state.running = false;
+          $('[data-start]').disabled = false;
+          $('[data-pause]').disabled = true;
+          status('The game did not accept the typed answer. Click its input once, then Start again.');
+          break;
+        }
+        status(`Submitting “${answer}”…`);
+        submit.click();
+        const result = await waitFor(() => {
+          const text = [...document.querySelectorAll('form ~ div span, [role="status"], .text-emerald-800, .text-rose-800')]
+            .map((el) => el.textContent.trim()).find((t) => /correct|incorrect|right answer|wrong answer/i.test(t));
+          const next = [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Next Flag');
+          return next ? { text: text || 'Answer evaluated', next } : null;
+        });
+        if (!result || !state.running) break;
+        log(answer, result.text);
+        status(`${result.text} Waiting ${state.delay / 1000}s before next flag.`);
+        await delay();
+        if (!state.running) break;
+        result.next.click();
+        status('Waiting for the next flag to load…');
+        await waitFor(() => {
+          const nextInput = document.querySelector('#flag-country-input');
+          return nextInput && !nextInput.disabled && nextInput.value === '' ? nextInput : null;
+        });
+        await delay();
+      }
+    } finally {
+      state.busy = false;
+      if (state.running && state.queue.length) run();
+    }
+  }
+
+  $('[data-delay]').addEventListener('change', (e) => {
+    state.delay = Math.max(1000, Math.min(120000, Number(e.target.value) * 1000 || 3000));
+    e.target.value = String(state.delay / 1000);
+  });
+  $('[data-start]').addEventListener('click', () => {
+    state.queue = $('[data-answers]').value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    state.running = true;
+    $('[data-start]').disabled = true;
+    $('[data-pause]').disabled = false;
+    status(state.queue.length ? `${state.queue.length} queued answer(s). Starting…` : 'Starting flag recognition…');
+    run();
+  });
+  $('[data-pause]').addEventListener('click', () => {
+    state.running = false;
+    $('[data-start]').disabled = false;
+    $('[data-pause]').disabled = true;
+    status('Paused.');
+  });
+  $('[data-min]').addEventListener('click', () => panel.classList.toggle('min'));
+  window[KEY] = { stop: () => $('[data-pause]').click() };
+})();
