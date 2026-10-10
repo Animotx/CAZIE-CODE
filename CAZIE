@@ -15,7 +15,7 @@
   const KEY = '__cazieFlagHelper';
   if (window[KEY]) return;
 
-  const state = { running: false, busy: false, queue: [], delay: 3000, timer: 0, catalog: null };
+  const state = { running: false, busy: false, queue: [], delay: 3000, timer: 0, catalog: null, nameMap: null, fallbackIndex: 0 };
   const panel = document.createElement('section');
   panel.id = 'cazie-flag-helper';
   panel.innerHTML = `
@@ -81,6 +81,7 @@
       nameMap = await response.json();
       try { localStorage.setItem(metaKey, JSON.stringify(nameMap)); } catch {}
     }
+    state.nameMap = nameMap;
     const entries = Object.entries(nameMap).filter(([code]) => /^[a-z]{2}$/.test(code));
     let cursor = 0;
     let loaded = 0;
@@ -121,6 +122,27 @@
     return state.catalog;
   }
 
+  async function fallbackAnswer() {
+    // If the flag is rendered in an unexpected way, rotate through the full
+    // available country-name list so the game still receives an answer.
+    let names = state.catalog?.map((c) => c.name);
+    if (!names?.length) {
+      try {
+        if (!state.nameMap) {
+          const response = await fetch('https://flagcdn.com/en/codes.json');
+          if (response.ok) state.nameMap = await response.json();
+        }
+        names = Object.entries(state.nameMap || {})
+          .filter(([code]) => /^[a-z]{2}$/.test(code))
+          .map(([code, name]) => aliasByCode[code] || name.replace(/\s*\([^)]*\)/g, '').trim());
+      } catch {}
+    }
+    if (!names?.length) names = ['United States', 'China', 'India', 'Brazil', 'Japan', 'Nigeria', 'France', 'Italy', 'Canada', 'Australia'];
+    const answer = names[state.fallbackIndex % names.length];
+    state.fallbackIndex++;
+    return answer;
+  }
+
   function svgMarkupToPixels(markup) {
     return new Promise((resolve, reject) => {
       const parsed = new DOMParser().parseFromString(markup, 'image/svg+xml');
@@ -154,10 +176,23 @@
   }
 
   async function recognizeFlag() {
-    const svg = [...document.querySelectorAll('svg[viewBox]')].find((el) => {
-      const box = el.getAttribute('viewBox')?.trim().split(/[ ,]+/).map(Number);
-      return box?.length === 4 && box[2] >= 500 && box[3] >= 500 && el.querySelector('rect,path,circle,polygon');
+    const flagFrame = [...document.querySelectorAll('div')].find((el) =>
+      typeof el.className === 'string' && el.className.includes('aspect-3/2') && el.className.includes('max-w-[280px]') && el.querySelector('svg, img')
+    );
+    const visibleSvgs = [...document.querySelectorAll('svg[viewBox]')].filter((el) => {
+      if (el.closest('#cazie-flag-helper')) return false;
+      if (!el.getClientRects().length) return false;
+      const viewBox = el.getAttribute('viewBox')?.trim().split(/[ ,]+/).map(Number);
+      if (viewBox?.length !== 4 || !(viewBox[2] > 0 && viewBox[3] > 0)) return false;
+      const cls = typeof el.className?.baseVal === 'string' ? el.className.baseVal : String(el.getAttribute('class') || '');
+      if (/lucide|icon/i.test(cls)) return false;
+      return true;
     });
+    const inFlagFrame = flagFrame ? visibleSvgs.filter((el) => flagFrame.contains(el)) : [];
+    const svg = inFlagFrame[0] || visibleSvgs
+      .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+      .filter(({ rect }) => rect.width >= 100 && rect.height >= 80)
+      .sort((a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height)[0]?.el;
     if (!svg) throw new Error('Could not find the displayed flag SVG.');
     const target = await svgMarkupToPixels(svg.outerHTML);
     const refs = await loadCatalog();
@@ -207,10 +242,14 @@
         if (!answer && $('[data-auto]').checked) {
           status('Recognizing the current flag…');
           let match;
-          try { match = await recognizeFlag(); }
-          catch (e) { stopWithMessage(e.message || 'Flag recognition failed.'); break; }
-          answer = match.name;
-          status(`${match.ambiguous ? 'Low-confidence best match' : 'Matched'}: ${answer} (${match.confidence}% pixel similarity). Typing anyway…`);
+          try {
+            match = await recognizeFlag();
+            answer = match.name;
+            status(`${match.ambiguous ? 'Low-confidence best match' : 'Matched'}: ${answer} (${match.confidence}% pixel similarity). Typing anyway…`);
+          } catch (e) {
+            answer = await fallbackAnswer();
+            status(`Flag image unavailable (${e.message}). Submitting fallback guess “${answer}” and continuing…`);
+          }
           if (!state.running) break;
         }
         if (!answer) { stopWithMessage('No answer queued. Enable recognition or add answers.'); break; }
