@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cazie's Flag Challenge Helper
 // @namespace    local.cazie.flag-helper
-// @version      3.0.0
-// @description  Automatically handle saved-credential login, activation, navigation, and the flag challenge.
+// @version      3.1.0
+// @description  Automatically handle saved-credential login, recoverable activation/login retries, navigation, and the flag challenge.
 // @match        https://cazie-s.onrender.com/*
 // @grant        none
 // @run-at       document-idle
@@ -15,9 +15,15 @@
   // The activation code is entered only on this site's activation form.
   const KEY = '__cazieFlagHelper';
   if (window[KEY]) return;
+  // Remove the one-use cache-buster after the new document has loaded.
+  const loadedUrl = new URL(location.href);
+  if (loadedUrl.searchParams.has('__cazie_retry')) {
+    loadedUrl.searchParams.delete('__cazie_retry');
+    history.replaceState(history.state, '', loadedUrl.href);
+  }
   const ACTIVATION_CODE = 'CAZIE-BX5Y-8WL';
 
-  const state = { running: true, userPaused: false, busy: false, queue: [], delay: 3000, timer: 0, catalog: null, nameMap: null, fallbackIndex: Number(localStorage.getItem('cazie_flag_fallback_index') || 0) };
+  const state = { running: true, userPaused: false, busy: false, queue: [], delay: 1000, timer: 0, catalog: null, nameMap: null, fallbackIndex: Number(localStorage.getItem('cazie_flag_fallback_index') || 0) };
   const panel = document.createElement('section');
   panel.id = 'cazie-flag-helper';
   panel.innerHTML = `
@@ -28,7 +34,7 @@
       <label>Optional answer queue (one per line)</label>
       <textarea data-answers rows="3" placeholder="Used instead of recognition when provided"></textarea>
       <label>Wait between actions (seconds)</label>
-      <input data-delay type="number" min="1" max="120" value="3">
+      <input data-delay type="number" min="1" max="120" step="1" value="1">
       <div class="buttons"><button type="button" data-start>Start</button><button type="button" data-pause disabled>Pause</button></div>
       <div data-status role="status">Auto-login and navigation are starting…</div>
       <ol data-log></ol>
@@ -314,6 +320,56 @@
   const flowClicks = new Map();
   let lastLoginAttempt = '';
   let lastActivationAttempt = '';
+  let reloadTimer = 0;
+  const PENDING_KEY = 'cazie_auto_flow_pending_v1';
+  const RETRY_KEY = 'cazie_auto_flow_retry_v1';
+  const getSession = (key) => { try { return JSON.parse(sessionStorage.getItem(key) || 'null'); } catch { return null; } };
+  const putSession = (key, value) => { try { sessionStorage.setItem(key, JSON.stringify(value)); } catch {} };
+  const clearSession = (key) => { try { sessionStorage.removeItem(key); } catch {} };
+  function clearPendingFlow() {
+    clearSession(PENDING_KEY);
+    clearSession(RETRY_KEY);
+    if (reloadTimer) clearTimeout(reloadTimer);
+    reloadTimer = 0;
+  }
+  function retryRefresh(kind) {
+    if (reloadTimer) return;
+    const retry = getSession(RETRY_KEY) || { count: 0 };
+    const waitMs = Math.min(120000, 5000 * (2 ** Math.min(retry.count || 0, 5)));
+    retry.count = (retry.count || 0) + 1;
+    retry.kind = kind;
+    putSession(RETRY_KEY, retry);
+    status(`${kind === 'activation' ? 'Activation' : 'Login'} is still pending. Refreshing in ${Math.ceil(waitMs / 1000)}s and retrying…`);
+    reloadTimer = window.setTimeout(() => {
+      // A userscript cannot invoke the browser's privileged Ctrl+Shift+F5
+      // shortcut. A one-use URL parameter forces a new document request.
+      const freshUrl = new URL(location.href);
+      freshUrl.searchParams.set('__cazie_retry', String(Date.now()));
+      location.replace(freshUrl.href);
+    }, waitMs);
+  }
+  function handleRejectedAuth(kind) {
+    const retry = getSession(RETRY_KEY) || { count: 0 };
+    // Repeating a rejected password/code can trigger account lockout. Retry a
+    // few times for a transient response, then leave the form available.
+    if ((retry.rejected || 0) >= 4) {
+      clearSession(PENDING_KEY);
+      retry.blocked = true;
+      putSession(RETRY_KEY, retry);
+      status(`${kind === 'activation' ? 'Activation code' : 'Login'} was rejected repeatedly. Check the code/credentials; automation is waiting to avoid an account lockout.`);
+      return;
+    }
+    retry.rejected = (retry.rejected || 0) + 1;
+    putSession(RETRY_KEY, retry);
+    clearSession(PENDING_KEY);
+    if (kind === 'login') lastLoginAttempt = '';
+    else lastActivationAttempt = '';
+    retryRefresh(kind);
+  }
+  function explicitAuthFailure(form) {
+    const text = `${form?.innerText || ''} ${document.body.innerText || ''}`;
+    return /invalid (email|username|password|credentials|activation code|code)|incorrect (email|username|password|credentials|activation code|code)|wrong password|user not found|code (is )?(expired|already used)|too many failed attempts/i.test(text);
+  }
   const visible = (el) => !!el && el.isConnected && el.getClientRects().length > 0 && !el.disabled;
   const buttonNamed = (name, scope = document) => [...scope.querySelectorAll('button[type="submit"],button')]
     .find((b) => visible(b) && b.textContent.trim().toLowerCase() === name.toLowerCase());
@@ -329,6 +385,17 @@
     if (setter) setter.call(input, value); else input.value = value;
     input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function pauseForAuthPage(kind) {
+    // Keep auth/navigation automation active, but stop the flag-answer loop.
+    // Do not mark this as a user pause so the challenge can auto-resume later.
+    if (state.running) {
+      state.running = false;
+      $('[data-start]').disabled = false;
+      $('[data-pause]').disabled = true;
+    }
+    status(`Answering paused on the ${kind} page. It will resume automatically when Guess the Flags opens.`);
   }
 
   function autoNavigate() {
@@ -348,9 +415,27 @@
     const activationInput = [...document.querySelectorAll('input[maxlength="14"],input[placeholder*="CAZIE-"]')]
       .find((input) => input.isConnected && input.getClientRects().length > 0 && /CAZIE-/i.test(input.placeholder || ''));
     if (activationInput) {
+      pauseForAuthPage('activation');
       const form = activationInput.closest('form');
       const verify = form && [...form.querySelectorAll('button[type="submit"],button')]
         .find((b) => /verify activation code/i.test(b.textContent));
+      const pending = getSession(PENDING_KEY);
+      if (getSession(RETRY_KEY)?.blocked) {
+        status('Activation was rejected repeatedly. Check the activation code, then reload after correcting it.');
+        return;
+      }
+      if (pending?.kind === 'activation') {
+        if (explicitAuthFailure(form)) {
+          handleRejectedAuth('activation');
+          return;
+        }
+        if (Date.now() - pending.startedAt > 20000) {
+          retryRefresh('activation');
+          return;
+        }
+        status('Waiting for activation verification…');
+        return;
+      }
       if (activationInput.value.trim().toUpperCase() !== ACTIVATION_CODE) {
         setControlledInput(activationInput, ACTIVATION_CODE);
         status('Entering the saved activation code…');
@@ -358,24 +443,43 @@
       }
       if (verify && !verify.disabled && lastActivationAttempt !== ACTIVATION_CODE) {
         lastActivationAttempt = ACTIVATION_CODE;
-        clickFlow('activation', verify);
-        status('Verifying activation code…');
+        putSession(PENDING_KEY, { kind: 'activation', startedAt: Date.now() });
+        if (clickFlow('activation', verify)) status('Verifying activation code…');
       }
       return;
     }
+    if (getSession(PENDING_KEY)?.kind === 'activation') clearPendingFlow();
     lastActivationAttempt = '';
 
     const password = [...document.querySelectorAll('input[type="password"],input[autocomplete="current-password"]')]
       .find((input) => visible(input));
     if (password) {
+      pauseForAuthPage('login');
       const form = password.closest('form');
       const username = form?.querySelector('input[autocomplete="username"],input[type="email"],input[type="text"]');
       const login = form && buttonNamed('LOGIN', form);
       const identity = username?.value?.trim() || '';
       const secret = password.value || '';
+      if (getSession(RETRY_KEY)?.blocked) {
+        status('Login was rejected repeatedly. Correct the browser-saved credentials, then reload to retry.');
+        return;
+      }
       if (!identity || !secret) {
         lastLoginAttempt = '';
         status('Waiting for saved browser credentials or manual sign-in. The script does not store your password.');
+        return;
+      }
+      const pending = getSession(PENDING_KEY);
+      if (pending?.kind === 'login') {
+        if (explicitAuthFailure(form)) {
+          handleRejectedAuth('login');
+          return;
+        }
+        if (Date.now() - pending.startedAt > 20000) {
+          retryRefresh('login');
+          return;
+        }
+        status('Waiting for sign-in to finish…');
         return;
       }
       const keepLabel = [...(form?.querySelectorAll('label') || [])]
@@ -389,11 +493,12 @@
       const attempt = `${identity}\u0000${secret}`;
       if (login && !login.disabled && lastLoginAttempt !== attempt) {
         lastLoginAttempt = attempt;
-        clickFlow('login', login);
-        status('Signing in with credentials already filled by the browser…');
+        putSession(PENDING_KEY, { kind: 'login', startedAt: Date.now() });
+        if (clickFlow('login', login)) status('Signing in with credentials already filled by the browser…');
       }
       return;
     }
+    if (getSession(PENDING_KEY)?.kind === 'login') clearPendingFlow();
     const flagTitle = [...document.querySelectorAll('h3')]
       .find((el) => el.textContent.trim().toLowerCase() === 'guess the flags');
     if (flagTitle) {
@@ -409,7 +514,7 @@
   }
 
   $('[data-delay]').addEventListener('change', (e) => {
-    state.delay = Math.max(1000, Math.min(120000, Number(e.target.value) * 1000 || 3000));
+    state.delay = Math.max(1000, Math.min(120000, (Number(e.target.value) || 1) * 1000));
     e.target.value = String(state.delay / 1000);
   });
   $('[data-start]').addEventListener('click', () => {
