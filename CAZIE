@@ -1,21 +1,23 @@
 // ==UserScript==
 // @name         Cazie's Flag Challenge Helper
 // @namespace    local.cazie.flag-helper
-// @version      2.0.0
-// @description  Recognize standard country flags from SVG artwork, submit with a delay, record results, and advance.
+// @version      3.0.0
+// @description  Automatically handle saved-credential login, activation, navigation, and the flag challenge.
 // @match        https://cazie-s.onrender.com/*
 // @grant        none
+// @run-at       document-idle
 // ==/UserScript==
 
 (() => {
   'use strict';
 
-  // Flag recognition compares the displayed SVG with public reference flag SVGs.
-  // It is intentionally confidence-gated because artwork variants can differ.
+  // Requires Chrome's password manager or an existing authenticated session for sign-in.
+  // The activation code is entered only on this site's activation form.
   const KEY = '__cazieFlagHelper';
   if (window[KEY]) return;
+  const ACTIVATION_CODE = 'CAZIE-BX5Y-8WL';
 
-  const state = { running: false, busy: false, queue: [], delay: 3000, timer: 0, catalog: null, nameMap: null, fallbackIndex: 0 };
+  const state = { running: true, userPaused: false, busy: false, queue: [], delay: 3000, timer: 0, catalog: null, nameMap: null, fallbackIndex: Number(localStorage.getItem('cazie_flag_fallback_index') || 0) };
   const panel = document.createElement('section');
   panel.id = 'cazie-flag-helper';
   panel.innerHTML = `
@@ -28,7 +30,7 @@
       <label>Wait between actions (seconds)</label>
       <input data-delay type="number" min="1" max="120" value="3">
       <div class="buttons"><button type="button" data-start>Start</button><button type="button" data-pause disabled>Pause</button></div>
-      <div data-status role="status">Open the flag challenge and press Start.</div>
+      <div data-status role="status">Auto-login and navigation are starting…</div>
       <ol data-log></ol>
       <small>Reference sites:
         <a href="https://www.countryflags.com/" target="_blank" rel="noopener">CountryFlags.com</a> ·
@@ -49,7 +51,7 @@
     #cazie-flag-helper.min .body{display:none}`;
   document.documentElement.append(style, panel);
   const $ = (sel) => panel.querySelector(sel);
-  const status = (msg) => { $('[data-status]').textContent = msg; };
+  const status = (msg) => { const el = $('[data-status]'); if (el.textContent !== msg) el.textContent = msg; };
   const log = (answer, result) => {
     const li = document.createElement('li');
     li.textContent = `${answer} — ${result}`;
@@ -140,6 +142,7 @@
     if (!names?.length) names = ['United States', 'China', 'India', 'Brazil', 'Japan', 'Nigeria', 'France', 'Italy', 'Canada', 'Australia'];
     const answer = names[state.fallbackIndex % names.length];
     state.fallbackIndex++;
+    try { localStorage.setItem('cazie_flag_fallback_index', String(state.fallbackIndex)); } catch {}
     return answer;
   }
 
@@ -304,8 +307,105 @@
       }
     } finally {
       state.busy = false;
-      if (state.running && state.queue.length) run();
+      if (state.running) window.setTimeout(run, 1000);
     }
+  }
+
+  const flowClicks = new Map();
+  let lastLoginAttempt = '';
+  let lastActivationAttempt = '';
+  const visible = (el) => !!el && el.isConnected && el.getClientRects().length > 0 && !el.disabled;
+  const buttonNamed = (name, scope = document) => [...scope.querySelectorAll('button[type="submit"],button')]
+    .find((b) => visible(b) && b.textContent.trim().toLowerCase() === name.toLowerCase());
+  const clickFlow = (key, button) => {
+    if (!visible(button) || Date.now() - (flowClicks.get(key) || 0) < 5000) return false;
+    flowClicks.set(key, Date.now());
+    button.click();
+    return true;
+  };
+  function setControlledInput(input, value) {
+    if (!input || input.value === value) return;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(input, value); else input.value = value;
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function autoNavigate() {
+    if (document.visibilityState === 'hidden') return;
+    if (isChallenge()) {
+      if (!state.running) {
+        if (state.userPaused) return;
+        state.running = true;
+        $('[data-start]').disabled = true;
+        $('[data-pause]').disabled = false;
+        status('Flag challenge found. Auto-answering…');
+        run();
+      }
+      return;
+    }
+
+    const activationInput = [...document.querySelectorAll('input[maxlength="14"],input[placeholder*="CAZIE-"]')]
+      .find((input) => input.isConnected && input.getClientRects().length > 0 && /CAZIE-/i.test(input.placeholder || ''));
+    if (activationInput) {
+      const form = activationInput.closest('form');
+      const verify = form && [...form.querySelectorAll('button[type="submit"],button')]
+        .find((b) => /verify activation code/i.test(b.textContent));
+      if (activationInput.value.trim().toUpperCase() !== ACTIVATION_CODE) {
+        setControlledInput(activationInput, ACTIVATION_CODE);
+        status('Entering the saved activation code…');
+        return;
+      }
+      if (verify && !verify.disabled && lastActivationAttempt !== ACTIVATION_CODE) {
+        lastActivationAttempt = ACTIVATION_CODE;
+        clickFlow('activation', verify);
+        status('Verifying activation code…');
+      }
+      return;
+    }
+    lastActivationAttempt = '';
+
+    const password = [...document.querySelectorAll('input[type="password"],input[autocomplete="current-password"]')]
+      .find((input) => visible(input));
+    if (password) {
+      const form = password.closest('form');
+      const username = form?.querySelector('input[autocomplete="username"],input[type="email"],input[type="text"]');
+      const login = form && buttonNamed('LOGIN', form);
+      const identity = username?.value?.trim() || '';
+      const secret = password.value || '';
+      if (!identity || !secret) {
+        lastLoginAttempt = '';
+        status('Waiting for saved browser credentials or manual sign-in. The script does not store your password.');
+        return;
+      }
+      const keepLabel = [...(form?.querySelectorAll('label') || [])]
+        .find((label) => /keep me signed in/i.test(label.textContent));
+      const keepBox = keepLabel?.querySelector('input[type="checkbox"]') || (keepLabel?.htmlFor ? form.querySelector(`#${CSS.escape(keepLabel.htmlFor)}`) : null);
+      if (keepBox && !keepBox.checked) {
+        keepBox.click();
+        status('Selecting “Keep me signed in”…');
+        return;
+      }
+      const attempt = `${identity}\u0000${secret}`;
+      if (login && !login.disabled && lastLoginAttempt !== attempt) {
+        lastLoginAttempt = attempt;
+        clickFlow('login', login);
+        status('Signing in with credentials already filled by the browser…');
+      }
+      return;
+    }
+    const flagTitle = [...document.querySelectorAll('h3')]
+      .find((el) => el.textContent.trim().toLowerCase() === 'guess the flags');
+    if (flagTitle) {
+      let card = flagTitle;
+      for (let i = 0; i < 8 && card && !buttonNamed('Start Earning', card); i++) card = card.parentElement;
+      const start = card && buttonNamed('Start Earning', card);
+      if (start && clickFlow('start-flags', start)) status('Opening Guess the Flags…');
+      return;
+    }
+
+    const categories = buttonNamed('Categories');
+    if (categories && clickFlow('categories', categories)) status('Opening Categories…');
   }
 
   $('[data-delay]').addEventListener('change', (e) => {
@@ -315,6 +415,7 @@
   $('[data-start]').addEventListener('click', () => {
     state.queue = $('[data-answers]').value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
     state.running = true;
+    state.userPaused = false;
     $('[data-start]').disabled = true;
     $('[data-pause]').disabled = false;
     status(state.queue.length ? `${state.queue.length} queued answer(s). Starting…` : 'Starting flag recognition…');
@@ -322,10 +423,20 @@
   });
   $('[data-pause]').addEventListener('click', () => {
     state.running = false;
+    state.userPaused = true;
     $('[data-start]').disabled = false;
     $('[data-pause]').disabled = true;
     status('Paused.');
   });
   $('[data-min]').addEventListener('click', () => panel.classList.toggle('min'));
   window[KEY] = { stop: () => $('[data-pause]').click() };
+  if (state.running) {
+    $('[data-start]').disabled = true;
+    $('[data-pause]').disabled = false;
+    run();
+  }
+  autoNavigate();
+  window.setInterval(autoNavigate, 900);
+  const flowObserver = new MutationObserver(() => autoNavigate());
+  flowObserver.observe(document.documentElement, { childList: true, subtree: true });
 })();
